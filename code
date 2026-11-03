@@ -1,0 +1,1647 @@
+local cloneref        = cloneref or function(x) return x end
+local getgenv         = getgenv or function() return _G end
+local getconnections  = getconnections
+local gethui          = gethui
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = cloneref(game:GetService("TweenService"))
+local UserInputService  = cloneref(game:GetService("UserInputService"))
+local LocalPlayer       = Players.LocalPlayer
+
+local print, next, pcall, tostring, type, pairs, ipairs
+    = print, next, pcall, tostring, type, pairs, ipairs
+local table_remove  = table.remove
+local table_concat  = table.concat
+local table_pack    = table.pack or function(...)
+    return { n = select("#", ...), ... }
+end
+local table_unpack  = table.unpack
+local string_sub    = string.sub
+local string_gsub   = string.gsub
+local string_format = string.format
+local math_floor    = math.floor
+local math_random   = math.random
+local math_min      = math.min
+local os_clock      = os.clock
+local os_date       = os.date
+local tick          = tick
+local task_wait     = (task and task.wait) or wait
+local task_spawn    = (task and task.spawn) or spawn
+local task_delay    = (task and task.delay) or function(t, f)
+    task_spawn(function() task_wait(t) f() end)
+end
+
+local Config = {
+    Enabled        = false,
+    AutoTypeCodes  = false,
+    AutoSubmit     = false,
+    AIRiddles      = false,
+    AIAutoSubmit   = false,
+    SubmitAfter    = 1,
+    MinFragment    = 1,
+    MaxFragWords   = 60,
+    ForceOpenCodes = true,
+
+    Debug          = true,
+    DebugToConsole = true,
+
+    SavedPos = {
+        XScale  = 1,
+        XOffset = -16,
+        YScale  = 0,
+        YOffset = 20,
+    },
+}
+
+local SAVE_FILE = "AuroraRedeemer.cfg"
+
+local function saveConfig()
+    if type(writefile) ~= "function" then return end
+    local lines = {
+        "Enabled="      .. tostring(Config.Enabled),
+        "AutoTypeCodes=".. tostring(Config.AutoTypeCodes),
+        "AutoSubmit="   .. tostring(Config.AutoSubmit),
+        "AIRiddles="    .. tostring(Config.AIRiddles),
+        "AIAutoSubmit=" .. tostring(Config.AIAutoSubmit),
+        "SubmitAfter="  .. tostring(Config.SubmitAfter),
+        "PosXScale="    .. tostring(Config.SavedPos.XScale),
+        "PosXOffset="   .. tostring(Config.SavedPos.XOffset),
+        "PosYScale="    .. tostring(Config.SavedPos.YScale),
+        "PosYOffset="   .. tostring(Config.SavedPos.YOffset),
+    }
+    pcall(writefile, SAVE_FILE, table_concat(lines, "\n"))
+end
+
+local function loadConfig()
+    if type(readfile) == "function" then
+        local ok, contents = pcall(readfile, SAVE_FILE)
+        if ok and type(contents) == "string" and contents ~= "" then
+            for line in contents:gmatch("[^\r\n]+") do
+                local key, val = line:match("^([%w_]+)=(.*)$")
+                if key then
+                    if key == "Enabled" then
+                        Config.Enabled = (val == "true")
+                    elseif key == "AutoTypeCodes" then
+                        Config.AutoTypeCodes = (val == "true")
+                    elseif key == "AutoSubmit" then
+                        Config.AutoSubmit = (val == "true")
+                    elseif key == "AIRiddles" then
+                        Config.AIRiddles = (val == "true")
+                    elseif key == "AIAutoSubmit" then
+                        Config.AIAutoSubmit = (val == "true")
+                    elseif key == "SubmitAfter" then
+                        Config.SubmitAfter = math.clamp(tonumber(val) or 1, 1, 10)
+                    elseif key == "PosXScale" then
+                        Config.SavedPos.XScale = tonumber(val) or 1
+                    elseif key == "PosXOffset" then
+                        Config.SavedPos.XOffset = tonumber(val) or -16
+                    elseif key == "PosYScale" then
+                        Config.SavedPos.YScale = tonumber(val) or 0
+                    elseif key == "PosYOffset" then
+                        Config.SavedPos.YOffset = tonumber(val) or 20
+                    end
+                end
+            end
+            return
+        end
+    end
+    saveConfig()
+end
+
+loadConfig()
+
+local State = {
+    typedCount   = 0,
+    buffer       = {},
+    solvedCount  = 0,
+    lastSeen     = nil,
+    lastSeenAt   = 0,
+    unloaded     = false,
+    connections  = {},
+    minimized    = false,
+}
+
+print("Remake By CRYONHUSH ezz deobf")
+getgenv().__aurora_fixed = "aurora-fixed-2026"
+
+local Debug = (function()
+    local function stamp()
+        return os_date("%H:%M:%S")
+    end
+    local function push(level, msg)
+        if not Config.Debug then return end
+        local line = string_format("[%s] %s %s", stamp(), level, msg)
+        if Config.DebugToConsole then print(line) end
+    end
+    local api = {}
+    api.log   = function(msg) push("INFO ", tostring(msg)) end
+    api.warn  = function(msg) push("WARN ", tostring(msg)) end
+    api.error = function(msg) push("ERROR", tostring(msg)) end
+    return api
+end)()
+
+local function try(label, fn, ...)
+    local results = table_pack(xpcall(function(...)
+        return fn(...)
+    end, function(e)
+        return tostring(e) .. "\n" .. debug.traceback("", 2)
+    end, ...))
+
+    local ok = results[1]
+    if not ok then
+        Debug.error(label .. " failed: " .. tostring(results[2]))
+        return nil, results[2]
+    end
+    if results.n == 1 then return true end
+    if results.n == 2 then return results[2] end
+    return table_unpack(results, 2, results.n)
+end
+
+local IGNORE_EXPIRED = {
+    "expired", "doesn't exist", "does not exist",
+    "wrong", "incorrect", "no longer", "invalid",
+}
+local IGNORE_REDEEMED = { "redeemed", "claimed", "already" }
+
+local function containsAny(s, list)
+    for _, w in ipairs(list) do
+        if s:find(w, 1, true) then return true end
+    end
+    return false
+end
+
+local function cleanText(s)
+    return (s:gsub("@@%u+@@%d+@@", ""):gsub("@@[%w]+@@", ""):gsub("@@", ""))
+end
+
+local FRAGMENT_BLACKLIST = {
+    ["top"] = true,
+}
+
+local function isBlacklisted(tok)
+    return FRAGMENT_BLACKLIST[tok:lower()] == true
+end
+
+local function extractFragment(raw)
+    if type(raw) ~= "string" then return nil end
+
+    local cleaned = raw:gsub("<[^>]->", " ")
+    cleaned = cleaned:gsub("%s+", " ")
+    cleaned = cleaned:gsub("^%s*(.-)%s*$", "%1")
+    if cleaned == "" then return nil end
+
+    for tok in cleaned:gmatch("%S+") do
+        local bare = tok:gsub("[%p]+$", ""):gsub("^[%p]+", "")
+        if bare ~= "" and bare:match("^[%w]+$") and not isBlacklisted(bare) then
+            return bare
+        end
+    end
+    return nil
+end
+
+local function isOwnUI(inst)
+    local node = inst
+    for _ = 1, 10 do
+        if not node then break end
+        if node.Name == "AuroraRedeemer" then return true end
+        node = node.Parent
+    end
+    return false
+end
+
+local function isVisibleChain(inst)
+    local node = inst
+    while node do
+        if node:IsA("GuiObject") and not node.Visible then return false end
+        if node:IsA("ScreenGui") then return node.Enabled end
+        node = node.Parent
+    end
+    return true
+end
+
+local function forceOpenCodes()
+    if not Config.ForceOpenCodes then return end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+
+    local codes = pg:FindFirstChild("Codes")
+    if not codes then return end
+
+    if codes:IsA("ScreenGui") then
+        pcall(function() codes.Enabled = true end)
+    end
+
+    local codes2 = codes:FindFirstChild("Codes") or codes
+    if codes2:IsA("GuiObject") then
+        pcall(function() codes2.Visible = true end)
+    end
+
+    local node = codes2
+    while node and node ~= codes do
+        if node:IsA("GuiObject") then
+            pcall(function() node.Visible = true end)
+        end
+        node = node.Parent
+    end
+
+    node = codes.Parent
+    while node do
+        if node:IsA("GuiObject") then
+            pcall(function() node.Visible = true end)
+        end
+        if node:IsA("ScreenGui") then
+            pcall(function() node.Enabled = true end)
+        end
+        node = node.Parent
+    end
+end
+
+local function findCodeBox()
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then
+        Debug.warn("no PlayerGui")
+        return nil
+    end
+
+    pcall(forceOpenCodes)
+
+    local codes = pg:FindFirstChild("Codes")
+    if codes then
+        if codes:IsA("ScreenGui") then
+            pcall(function() codes.Enabled = true end)
+        end
+
+        local codes2 = codes:FindFirstChild("Codes") or codes
+        if codes2:IsA("GuiObject") then
+            pcall(function() codes2.Visible = true end)
+        end
+
+        local parent = codes2
+        while parent and parent ~= codes do
+            if parent:IsA("GuiObject") then
+                pcall(function() parent.Visible = true end)
+            end
+            parent = parent.Parent
+        end
+        for _, descendant in ipairs(codes2:GetDescendants()) do
+            if descendant:IsA("TextBox") and not isOwnUI(descendant) then
+                Debug.log("CodeBox (Codes subtree): " .. descendant:GetFullName())
+                return descendant
+            end
+        end
+        Debug.warn("Codes subtree present but no TextBox - falling through")
+    else
+        Debug.log("Codes subtree not found - dynamic scan")
+    end
+
+    local deadline = tick() + 2
+
+    while tick() < deadline do
+        local candidates = {}
+        for _, child in ipairs(pg:GetChildren()) do
+            if child:IsA("ScreenGui") and child.Enabled and not isOwnUI(child) then
+                for _, d in ipairs(child:GetDescendants()) do
+                    if d:IsA("TextBox") and not isOwnUI(d) then
+                        candidates[#candidates + 1] = d
+                    end
+                end
+            end
+        end
+
+        for _, tb in ipairs(candidates) do
+            if isVisibleChain(tb) then
+                local n = tb.Name:lower()
+                local p = (tb.Parent and tb.Parent.Name or ""):lower()
+                if n:find("code") or p:find("code")
+                   or n:find("redeem") or p:find("redeem")
+                   or n:find("input") or p:find("textbox")
+                   or n:find("enter") then
+                    Debug.log("CodeBox (dynamic preferred): " .. tb:GetFullName())
+                    return tb
+                end
+            end
+        end
+
+        for _, tb in ipairs(candidates) do
+            if isVisibleChain(tb) then
+                Debug.log("CodeBox (dynamic fallback): " .. tb:GetFullName())
+                return tb
+            end
+        end
+
+        pcall(forceOpenCodes)
+        task_wait(0.1)
+    end
+
+    Debug.warn("no codebox visible after 2s poll")
+    return nil
+end
+
+local SUBMIT_VERBS = {
+    "submit", "redeem", "claim", "confirm", "enter",
+    "send", "apply", "ok", "use", "go", "check", "go!", "play",
+}
+
+local function matchesVerb(str)
+    for _, v in ipairs(SUBMIT_VERBS) do
+        if str:find(v, 1, true) then return true end
+    end
+    return false
+end
+
+local function findConfirmButton(box)
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+
+    local codes = pg:FindFirstChild("Codes")
+    if codes then
+        local codes2 = codes:FindFirstChild("Codes") or codes
+        for _, descendant in ipairs(codes2:GetDescendants()) do
+            if (descendant:IsA("TextButton") or descendant:IsA("ImageButton"))
+               and not isOwnUI(descendant) then
+                local n = descendant.Name:lower()
+                local t = ""
+                pcall(function() t = tostring(descendant.Text or ""):lower() end)
+                if matchesVerb(n) or matchesVerb(t) then
+                    return descendant
+                end
+            end
+        end
+
+        for _, descendant in ipairs(codes2:GetDescendants()) do
+            if (descendant:IsA("TextButton") or descendant:IsA("ImageButton"))
+               and not isOwnUI(descendant) then
+                local n = descendant.Name:lower()
+                if not n:find("close") and not n:find("toggle") and n ~= "x" then
+                    return descendant
+                end
+            end
+        end
+    end
+
+    if box then
+        local parent = box.Parent
+        for _ = 1, 8 do
+            if not parent then break end
+            for _, d in ipairs(parent:GetDescendants()) do
+                if (d:IsA("TextButton") or d:IsA("ImageButton"))
+                   and d ~= box and not isOwnUI(d) then
+                    local n = d.Name:lower()
+                    local t = ""
+                    pcall(function() t = tostring(d.Text or ""):lower() end)
+                    if matchesVerb(n) or matchesVerb(t) then return d end
+                end
+            end
+            parent = parent.Parent
+        end
+    end
+
+    return nil
+end
+
+local function fireButton(btn)
+    if not btn then return false end
+
+    local attempts = {
+        function() btn.MouseButton1Click:Fire() end,
+        function() btn.Activated:Fire() end,
+    }
+
+    if type(firesignal) == "function" then
+        attempts[#attempts + 1] = function() firesignal(btn.MouseButton1Click) end
+        attempts[#attempts + 1] = function() firesignal(btn.Activated) end
+    end
+
+    if type(getconnections) == "function" then
+        attempts[#attempts + 1] = function()
+            local ok, conns = pcall(getconnections, btn.MouseButton1Click)
+            if ok and type(conns) == "table" then
+                for _, c in ipairs(conns) do
+                    pcall(function() c:Fire() end)
+                end
+            end
+            local ok2, conns2 = pcall(getconnections, btn.Activated)
+            if ok2 and type(conns2) == "table" then
+                for _, c in ipairs(conns2) do
+                    pcall(function() c:Fire() end)
+                end
+            end
+        end
+    end
+
+    if type(fireclick) == "function" then
+        attempts[#attempts + 1] = function() fireclick(btn) end
+    end
+
+    local fired = false
+    for _, fn in ipairs(attempts) do
+        local ok = pcall(fn)
+        fired = fired or ok
+    end
+    return fired
+end
+
+local function fireFocusLost(box)
+    if not box then return false end
+    local fired = false
+
+    if type(firesignal) == "function" then
+        fired = pcall(firesignal, box.FocusLost, true) or fired
+    end
+
+    if type(getconnections) == "function" then
+        local ok, conns = pcall(getconnections, box.FocusLost)
+        if ok and type(conns) == "table" then
+            for _, c in ipairs(conns) do
+                local fn = nil
+                pcall(function() fn = c.Function end)
+
+                if fn
+                   and type(getupvalues) == "function"
+                   and type(setupvalue) == "function" then
+                    local ok2, ups = pcall(getupvalues, fn)
+                    if ok2 and type(ups) == "table" then
+                        for k, v in pairs(ups) do
+                            if type(v) == "boolean" and v == true then
+                                pcall(setupvalue, fn, k, false)
+                            end
+                        end
+                    end
+                end
+
+                local ok3 = pcall(function()
+                    if c.Enabled ~= false then
+                        c:Fire(true)
+                    end
+                end)
+                fired = fired or ok3
+            end
+        end
+    end
+
+    return fired
+end
+
+local function submitCode(text)
+    if type(text) ~= "string" or text == "" then
+        return false, "empty text"
+    end
+
+    local box = findCodeBox()
+    if not box then
+        task_wait(0.25)
+        pcall(forceOpenCodes)
+        box = findCodeBox()
+    end
+    if not box then
+        return false, "no codebox visible"
+    end
+
+    pcall(function() box:CaptureFocus() end)
+    task_wait(0.02)
+
+    pcall(function() box.Text = "" end)
+    task_wait(0.02)
+    local okSet = pcall(function() box.Text = text end)
+    if not okSet then
+        return false, "text set failed"
+    end
+    task_wait(0.05)
+
+    local btn = findConfirmButton(box)
+    if btn then
+        fireButton(btn)
+    end
+
+    fireFocusLost(box)
+
+    Debug.log("Typed + submitted: " .. text)
+    return true, "submitted"
+end
+
+local function getHandlerSource(fn)
+    if type(fn) ~= "function" then return nil end
+    if type(debug) == "table" and type(debug.info) == "function" then
+        local ok, src = pcall(debug.info, fn, "s")
+        if ok and type(src) == "string" and #src > 0 then return src end
+    end
+    if type(debug) == "table" and type(debug.getinfo) == "function" then
+        local ok, info = pcall(debug.getinfo, fn)
+        if ok and type(info) == "table" then
+            if type(info.short_src) == "string" and #info.short_src > 0 then
+                return info.short_src
+            end
+            if type(info.source) == "string" and #info.source > 0 then
+                return info.source
+            end
+        end
+    end
+    return nil
+end
+
+local function findNotificationRemote()
+    if _G.PhiNotifyRemote then return _G.PhiNotifyRemote end
+
+    if type(getconnections) ~= "function" then
+        Debug.warn("getconnections unavailable")
+        return nil
+    end
+    if type(debug) ~= "table"
+       or (type(debug.getinfo) ~= "function" and type(debug.info) ~= "function") then
+        Debug.warn("debug.getinfo unavailable")
+        return nil
+    end
+
+    local netFolder
+    local ok = pcall(function()
+        local packages = ReplicatedStorage:FindFirstChild("Packages")
+        if not packages then return end
+        netFolder = packages:FindFirstChild("Net")
+    end)
+    if not ok or not netFolder then
+        Debug.warn("Packages.Net not found")
+        return nil
+    end
+
+    local descendants = netFolder:GetDescendants()
+    Debug.log(string_format("Scanning %d descendants", #descendants))
+
+    local scanned = 0
+    for _, inst in ipairs(descendants) do
+        local isRemote = false
+        pcall(function() isRemote = inst:IsA("RemoteEvent") end)
+        if isRemote then
+            scanned = scanned + 1
+            local conns
+            local ok2 = pcall(function() conns = getconnections(inst.OnClientEvent) end)
+            if ok2 and type(conns) == "table" then
+                for _, c in ipairs(conns) do
+                    local fn
+                    pcall(function() fn = c.Function end)
+                    if type(fn) == "function" then
+                        local src = getHandlerSource(fn)
+                        if type(src) == "string"
+                           and src:find("NotificationController", 1, true) then
+                            Debug.log("Matched: " .. inst:GetFullName())
+                            _G.PhiNotifyRemote = inst
+                            return inst
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    Debug.warn(string_format("No match (scanned %d remotes)", scanned))
+    return nil
+end
+
+local COLORS = {
+    shell = Color3.fromRGB(15, 15, 18),
+    surf  = Color3.fromRGB(24, 24, 28),
+    sunk  = Color3.fromRGB(18, 18, 22),
+    line  = Color3.fromRGB(45, 45, 50),
+    hi    = Color3.fromRGB(255, 255, 255),
+    md    = Color3.fromRGB(200, 200, 200),
+    lo    = Color3.fromRGB(100, 100, 100),
+    aur   = Color3.fromRGB(255, 120, 0),
+    vio   = Color3.fromRGB(255, 80, 0),
+    off   = Color3.fromRGB(90, 90, 90),
+    good  = Color3.fromRGB(255, 150, 50),
+    bad   = Color3.fromRGB(255, 80, 80),
+}
+
+local GLYPH = { dash = "—", minus = "−", cross = "×", tick = "✓" }
+
+local UI = {}
+local uiConnections = {}
+
+local function trackConn(conn)
+    uiConnections[#uiConnections + 1] = conn
+    return conn
+end
+
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function corner(inst, radius)
+    new("UICorner", { CornerRadius = UDim.new(0, radius) }, inst)
+    return inst
+end
+
+local function circle(inst)
+    new("UICorner", { CornerRadius = UDim.new(1, 0) }, inst)
+    return inst
+end
+
+local function stroke(inst, color, transparency)
+    new("UIStroke", {
+        Color = color,
+        Thickness = 1,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, inst)
+    return inst
+end
+
+local function tween(inst, time, props)
+    TweenService:Create(inst,
+        TweenInfo.new(time, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+        props):Play()
+end
+
+local function hover(button, label, idle, active)
+    trackConn(button.MouseEnter:Connect(function()
+        tween(label, 0.12, { TextColor3 = active })
+    end))
+    trackConn(button.MouseLeave:Connect(function()
+        tween(label, 0.18, { TextColor3 = idle })
+    end))
+end
+
+local function chevron(parent, color)
+    local holder = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(16, 12),
+        BackgroundTransparency = 1,
+    }, parent)
+    for i = 1, 2 do
+        circle(new("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromOffset(i == 1 and 6 or 10, 5),
+            Size = UDim2.fromOffset(7, 2),
+            BackgroundColor3 = color,
+            BorderSizePixel = 0,
+            Rotation = i == 1 and 45 or -45,
+        }, holder))
+    end
+    return holder
+end
+
+local function buildUI(parent)
+    Debug.log("buildUI start")
+
+    local root = new("ScreenGui", {
+        Name = "AuroraRedeemer",
+        ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        DisplayOrder = 9999,
+    }, parent)
+    pcall(function() if protectgui then protectgui(root) end end)
+
+    local PAD, GAP = 8, 8
+    local HEADER_H = 38
+
+    local frame = new("Frame", {
+        Size = UDim2.fromOffset(316, HEADER_H),
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, 332, 0, 20),
+        BackgroundColor3 = COLORS.shell,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Active = true,
+    }, root)
+    corner(frame, 12)
+    stroke(frame, COLORS.line, 0.2)
+
+    do
+        local grad = new("Frame", {
+            Size = UDim2.new(1, 0, 0, 6),
+            BackgroundColor3 = COLORS.vio,
+            BackgroundTransparency = 0.87,
+            BorderSizePixel = 0,
+            ZIndex = 0,
+        }, frame)
+        corner(grad, 12)
+        new("UIGradient", {
+            Rotation = 90,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+        }, grad)
+    end
+
+    local accent = new("Frame", {
+        Position = UDim2.fromOffset(0, 7),
+        Size = UDim2.new(0, 2, 1, -14),
+        BackgroundColor3 = COLORS.aur,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, frame)
+    circle(accent)
+    new("UIGradient", {
+        Rotation = 90,
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(1, 0.7),
+        }),
+    }, accent)
+
+    local header = new("Frame", {
+        Size = UDim2.new(1, 0, 0, HEADER_H),
+        Position = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1,
+        ZIndex = 3,
+    }, frame)
+
+    local brand = new("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, PAD + 2, 0.5, 0),
+        Size = UDim2.fromOffset(200, 16),
+        BackgroundTransparency = 1,
+    }, header)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 6),
+    }, brand)
+
+    new("ImageLabel", {
+        LayoutOrder = 1,
+        Size = UDim2.fromOffset(14, 14),
+        BackgroundTransparency = 1,
+        Image = "rbxassetid://133811381398870",
+        ImageColor3 = COLORS.aur,
+        ScaleType = Enum.ScaleType.Fit,
+    }, brand)
+
+    new("TextLabel", {
+        LayoutOrder = 2,
+        AutomaticSize = Enum.AutomaticSize.X,
+        Size = UDim2.fromOffset(0, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBlack,
+        TextSize = 12,
+        TextColor3 = COLORS.hi,
+        Text = "AURORA",
+    }, brand)
+
+    new("TextLabel", {
+        LayoutOrder = 3,
+        AutomaticSize = Enum.AutomaticSize.X,
+        Size = UDim2.fromOffset(0, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        TextColor3 = COLORS.lo,
+        Text = "REDEEMER",
+    }, brand)
+
+    local toggleBtn = new("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -60, 0.5, 0),
+        Size = UDim2.fromOffset(34, 18),
+        BackgroundColor3 = COLORS.sunk,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Text = "",
+    }, header)
+    circle(toggleBtn)
+    stroke(toggleBtn, COLORS.line, 0.25)
+
+    local toggleKnob = new("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 2, 0.5, 0),
+        Size = UDim2.fromOffset(14, 14),
+        BackgroundColor3 = COLORS.lo,
+        BorderSizePixel = 0,
+    }, toggleBtn)
+    circle(toggleKnob)
+
+    local minBtn = new("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -34, 0.5, 0),
+        Size = UDim2.fromOffset(20, 20),
+        BackgroundColor3 = COLORS.surf,
+        BackgroundTransparency = 0.4,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Text = "",
+    }, header)
+    corner(minBtn, 6)
+    stroke(minBtn, COLORS.line, 0.45)
+
+    local minLabel = new("TextLabel", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        TextColor3 = COLORS.md,
+        Text = "v",                      
+    }, minBtn)
+    hover(minBtn, minLabel, COLORS.md, COLORS.aur)
+
+    local closeBtn = new("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -8, 0.5, 0),
+        Size = UDim2.fromOffset(20, 20),
+        BackgroundColor3 = COLORS.surf,
+        BackgroundTransparency = 0.4,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Text = "",
+    }, header)
+    corner(closeBtn, 6)
+    stroke(closeBtn, COLORS.line, 0.45)
+
+    local closeLabel = new("TextLabel", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextColor3 = COLORS.md,
+        Text = GLYPH.cross,
+    }, closeBtn)
+    hover(closeBtn, closeLabel, COLORS.md, COLORS.bad)
+
+    local body = new("Frame", {
+        Position = UDim2.fromOffset(0, HEADER_H),
+        Size = UDim2.new(1, 0, 0, 0),
+        BackgroundTransparency = 1,
+        ClipsDescendants = true,
+    }, frame)
+    new("UIPadding", {
+        PaddingLeft = UDim.new(0, PAD + 2),
+        PaddingRight = UDim.new(0, PAD),
+        PaddingTop = UDim.new(0, 2),
+    }, body)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 8),
+    }, body)
+
+    local rows = {}
+    local renderNotif
+
+    local function row(order, height, clips)
+        local r = new("Frame", {
+            LayoutOrder = order,
+            Size = UDim2.new(1, 0, 0, height),
+            BackgroundTransparency = 1,
+            ClipsDescendants = clips and true or false,
+        }, body)
+        local entry = { frame = r, h = height }
+        rows[#rows + 1] = entry
+        return r, entry
+    end
+
+    local function bodyHeight()
+        local total = 0
+        for _, r in ipairs(rows) do total = total + r.h end
+        return total + GAP * (#rows - 1) + 2 + PAD
+    end
+
+    local statusRow = row(1, 26)
+    new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 12, 0.5, 0),
+        Size = UDim2.fromOffset(8, 8),
+        BackgroundColor3 = COLORS.aur,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, statusRow)
+    local statusInner = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 12, 0.5, 0),
+        Size = UDim2.fromOffset(7, 7),
+        BackgroundColor3 = COLORS.aur,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, statusRow)
+    circle(statusInner)
+
+    local statusLabel = new("TextLabel", {
+        Position = UDim2.fromOffset(24, 0),
+        Size = UDim2.new(1, -110, 1, 0),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = COLORS.aur,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "READY",
+    }, statusRow)
+
+    local statusPill = new("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, 0, 0.5, 0),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Size = UDim2.fromOffset(0, 16),
+        BackgroundColor3 = COLORS.surf,
+        BorderSizePixel = 0,
+        Font = Enum.Font.RobotoMono,
+        TextSize = 10,
+        TextColor3 = COLORS.md,
+        Text = "",
+        Visible = false,
+    }, statusRow)
+    corner(statusPill, 6)
+    stroke(statusPill, COLORS.line, 0.55)
+
+    local notifRow = row(2, 54)
+    local notifCard = new("Frame", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = COLORS.sunk,
+        BorderSizePixel = 0,
+    }, notifRow)
+    corner(notifCard, 8)
+    stroke(notifCard, COLORS.line, 0.55)
+
+    new("TextLabel", {
+        Position = UDim2.fromOffset(10, 6),
+        Size = UDim2.fromOffset(110, 12),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 9,
+        TextColor3 = COLORS.lo,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "NOTIFICATION",
+    }, notifCard)
+
+    local notifCounter = new("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -10, 0, 6),
+        Size = UDim2.fromOffset(120, 12),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 9,
+        TextColor3 = COLORS.lo,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Text = "0/4",
+    }, notifCard)
+
+    local notifText = new("TextLabel", {
+        Position = UDim2.fromOffset(10, 21),
+        Size = UDim2.new(1, -20, 0, 26),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.RobotoMono,
+        TextSize = 12,
+        TextColor3 = COLORS.lo,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Text = "waiting for code",
+    }, notifCard)
+
+    renderNotif = function()
+        local n = #State.buffer
+        if n == 0 then
+            notifText.Text = "waiting for code"
+            notifText.TextColor3 = COLORS.lo
+            notifCounter.Text = "0/" .. tostring(Config.SubmitAfter)
+            notifCounter.TextColor3 = COLORS.lo
+        else
+            notifText.Text = table_concat(State.buffer)
+            notifText.TextColor3 = COLORS.aur
+            notifCounter.Text = tostring(n) .. "/" .. tostring(Config.SubmitAfter)
+            notifCounter.TextColor3 = COLORS.aur
+        end
+    end
+
+    local statRow = row(3, 54)
+
+    local function statTile(order, label)
+        local tile = new("Frame", {
+            Position = UDim2.new(order, order > 0 and 4 or 0, 0, 0),
+            Size = UDim2.new(0.5, -6, 1, 0),
+            BackgroundColor3 = COLORS.sunk,
+            BorderSizePixel = 0,
+        }, statRow)
+        corner(tile, 6)
+        stroke(tile, COLORS.line, 0.55)
+
+        new("TextLabel", {
+            Position = UDim2.fromOffset(10, 6),
+            Size = UDim2.fromOffset(80, 12),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold,
+            TextSize = 9,
+            TextColor3 = COLORS.lo,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = label,
+        }, tile)
+
+        local value = new("TextLabel", {
+            Position = UDim2.fromOffset(10, 22),
+            Size = UDim2.new(1, -20, 0, 22),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.RobotoMono,
+            TextSize = 15,
+            TextColor3 = COLORS.hi,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = "0",
+        }, tile)
+
+        local sub = new("TextLabel", {
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -10, 0, 6),
+            Size = UDim2.fromOffset(60, 12),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.RobotoMono,
+            TextSize = 10,
+            TextColor3 = COLORS.good,
+            TextXAlignment = Enum.TextXAlignment.Right,
+            Text = "",
+        }, tile)
+
+        return tile, value, sub
+    end
+
+    local tileSolved, tileSolvedVal = statTile(0, "SOLVED")
+    local tileBuffer, tileBufferVal, tileBufferSub = statTile(0.5, "BUFFER")
+    tileBufferSub.Text = "PARTS"
+
+    local settingsRow, settingsEntry = row(5, 26, true)
+
+    local settingsBtn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundColor3 = COLORS.surf,
+        BackgroundTransparency = 0.25,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Text = "",
+        ZIndex = 5,
+    }, settingsRow)
+    corner(settingsBtn, 8)
+    stroke(settingsBtn, COLORS.line, 0.55)
+
+    local settingsLabel = new("TextLabel", {
+        Position = UDim2.fromOffset(10, 0),
+        Size = UDim2.new(1, -40, 0, 22),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 9,
+        TextColor3 = COLORS.md,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "SETTINGS",
+    }, settingsBtn)
+
+    local settingsChevron = chevron(settingsBtn, COLORS.md)
+    settingsChevron.AnchorPoint = Vector2.new(0, 0.5)
+    settingsChevron.Position = UDim2.new(1, -14, 0.5, 0)
+    settingsChevron.Rotation = -90
+    hover(settingsBtn, settingsLabel, COLORS.md, COLORS.hi)
+
+    local settingsBody = new("Frame", {
+        Position = UDim2.fromOffset(0, 26),
+        Size = UDim2.new(1, 0, 0, 0),
+        BackgroundTransparency = 1,
+        ZIndex = 1,
+    }, settingsRow)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, settingsBody)
+
+    local SETTINGS_ROW_H = 26
+    local SETTINGS_ROWS = 5
+
+    local function settingFrame(order, label)
+        local r = new("Frame", {
+            LayoutOrder = order,
+            Size = UDim2.new(1, 0, 0, SETTINGS_ROW_H),
+            BackgroundTransparency = 1,
+        }, settingsBody)
+        local lbl = new("TextLabel", {
+            Position = UDim2.fromOffset(8, 0),
+            Size = UDim2.new(1, -84, 1, 0),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
+            TextColor3 = COLORS.md,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = label,
+        }, r)
+        return r, lbl
+    end
+
+    local function addToggle(order, label, get, set)
+        local r, lbl = settingFrame(order, label)
+        local btn = new("TextButton", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, 0, 0.5, 0),
+            Size = UDim2.fromOffset(30, 16),
+            BackgroundColor3 = COLORS.sunk,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Text = "",
+        }, r)
+        circle(btn)
+        stroke(btn, COLORS.line, 0.3)
+
+        local knob = new("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 2, 0.5, 0),
+            Size = UDim2.fromOffset(12, 12),
+            BackgroundColor3 = COLORS.lo,
+            BorderSizePixel = 0,
+        }, btn)
+        circle(knob)
+
+        local function render()
+            local on = get() and true or false
+            if on then
+                tween(knob, 0.14, { Position = UDim2.new(0, 14, 0.5, 0), BackgroundColor3 = COLORS.aur })
+            else
+                tween(knob, 0.14, { Position = UDim2.new(0, 2, 0.5, 0), BackgroundColor3 = COLORS.lo })
+            end
+            lbl.TextColor3 = on and COLORS.md or COLORS.lo
+        end
+        render()
+
+        trackConn(btn.MouseButton1Click:Connect(function()
+            set(not get())
+            render()
+            saveConfig()
+        end))
+        return render
+    end
+
+    local function addStepper(order, label, get, set, min, max)
+        local r, lbl = settingFrame(order, label)
+
+        local value = new("TextLabel", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -26, 0.5, 0),
+            Size = UDim2.fromOffset(22, 18),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.RobotoMono,
+            TextSize = 11,
+            TextColor3 = COLORS.hi,
+            Text = tostring(get()),
+        }, r)
+
+        local function mkBtn(x, txt)
+            local b = new("TextButton", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, x, 0.5, 0),
+                Size = UDim2.fromOffset(16, 18),
+                BackgroundColor3 = COLORS.surf,
+                BackgroundTransparency = 0.35,
+                BorderSizePixel = 0,
+                AutoButtonColor = false,
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                TextColor3 = COLORS.md,
+                Text = txt,
+            }, r)
+            corner(b, 5)
+            stroke(b, COLORS.line, 0.5)
+            return b
+        end
+
+        local minus = mkBtn(-52, GLYPH.minus)
+        local plus  = mkBtn(0, "+")
+
+        local function render()
+            local v = tonumber(get()) or min
+            value.Text = tostring(v)
+            minus.TextColor3 = v > min and COLORS.md or COLORS.lo
+            plus.TextColor3  = v < max and COLORS.md or COLORS.lo
+            lbl.TextColor3 = COLORS.md
+        end
+        render()
+
+        local function step(delta)
+            set(math.clamp((tonumber(get()) or min) + delta, min, max))
+            render()
+            saveConfig()
+        end
+
+        trackConn(minus.MouseButton1Click:Connect(function() step(-1) end))
+        trackConn(plus.MouseButton1Click:Connect(function() step(1) end))
+        return render
+    end
+
+    addToggle(1, "AUTO TYPE CODES", function() return Config.AutoTypeCodes end,
+        function(v) Config.AutoTypeCodes = v end)
+    addToggle(2, "AUTO SUBMIT", function() return Config.AutoSubmit end,
+        function(v) Config.AutoSubmit = v end)
+    addToggle(3, "AUTO RIDDLES", function() return Config.AIRiddles end,
+        function(v) Config.AIRiddles = v end)
+    addToggle(4, "AI AUTO SUBMIT", function() return Config.AIAutoSubmit end,
+        function(v) Config.AIAutoSubmit = v end)
+
+    addStepper(5, "SUBMIT AFTER",
+        function() return Config.SubmitAfter end,
+        function(v)
+            Config.SubmitAfter = v
+            if #State.buffer > 0 then
+                State.buffer = {}
+            end
+            renderNotif()
+        end, 1, 10)
+
+    settingsBody.Size = UDim2.new(1, 0, 0, SETTINGS_ROW_H * SETTINGS_ROWS)
+
+    local footerRow = row(6, 26)
+
+    local resetBtn = new("TextButton", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.fromOffset(62, 22),
+        BackgroundColor3 = COLORS.surf,
+        BackgroundTransparency = 0.25,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = COLORS.md,
+        Text = "RESET",
+    }, footerRow)
+    corner(resetBtn, 7)
+    stroke(resetBtn, COLORS.line, 0.5)
+
+    local footerStatus = new("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, 0, 0.5, 0),
+        Size = UDim2.fromOffset(200, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 9,
+        TextColor3 = COLORS.lo,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Text = "",
+    }, footerRow)
+
+    local settingsExpanded = false
+
+    local function resize(animate)
+        if State.minimized then return end
+        local bodyH = bodyHeight()
+        local total = HEADER_H + bodyH
+        local frameSize = UDim2.fromOffset(316, total)
+        local bodySize  = UDim2.new(1, 0, 0, bodyH)
+
+        if animate then
+            tween(frame, 0.24, { Size = frameSize })
+            tween(body, 0.24, { Size = bodySize })
+        else
+            frame.Size = frameSize
+            body.Size  = bodySize
+        end
+
+        for _, r in ipairs(rows) do
+            if r.frame.Size.Y.Offset ~= r.h then
+                local s = UDim2.new(1, 0, 0, r.h)
+                if animate then tween(r.frame, 0.24, { Size = s })
+                else r.frame.Size = s end
+            end
+        end
+    end
+
+    local function flash(inst, color)
+        if not inst then return end
+        if inst:IsA("UIStroke") then
+            inst.Color = color
+            inst.Transparency = 0.05
+            tween(inst, 0.7, { Transparency = 0.55 })
+            task_delay(1.2, function()
+                if not State.unloaded then inst.Color = COLORS.line end
+            end)
+        elseif inst:IsA("Frame") then
+            local original = inst.BackgroundColor3
+            inst.BackgroundColor3 = color
+            task_delay(0.7, function()
+                if not State.unloaded then inst.BackgroundColor3 = original end
+            end)
+        end
+    end
+
+    local function renderStatus()
+        local status, color
+
+        if not Config.Enabled then
+            status, color = "DISABLED", COLORS.off
+        elseif #State.buffer > 0 then
+            status, color = "COLLECTING", COLORS.aur
+        elseif State.typedCount > 0 then
+            status, color = "TYPING", COLORS.aur
+        else
+            status, color = "READY", COLORS.aur
+        end
+
+        statusLabel.Text = status
+        tween(statusLabel, 0.25, { TextColor3 = color })
+        tween(statusInner, 0.18, { BackgroundColor3 = color })
+
+        if Config.Enabled then
+            tween(toggleKnob, 0.14, {
+                Position = UDim2.new(0, 14, 0.5, 0),
+                BackgroundColor3 = COLORS.aur,
+            })
+        else
+            tween(toggleKnob, 0.14, {
+                Position = UDim2.new(0, 2, 0.5, 0),
+                BackgroundColor3 = COLORS.lo,
+            })
+        end
+
+        renderNotif()
+
+        tileSolvedVal.Text = tostring(State.solvedCount)
+        tileBufferVal.Text = tostring(#State.buffer)
+        tileBufferSub.Text = Config.AutoSubmit and "AUTO" or "MANUAL"
+    end
+
+    local function renderFooter(text)
+        footerStatus.Text = text or ""
+    end
+
+    trackConn(toggleBtn.MouseButton1Click:Connect(function()
+        Config.Enabled = not Config.Enabled
+        Debug.log("Master switch: " .. tostring(Config.Enabled))
+        renderStatus()
+        saveConfig()
+    end))
+
+    trackConn(minBtn.MouseButton1Click:Connect(function()
+        State.minimized = not State.minimized
+        if State.minimized then
+            body.Visible = false
+            minLabel.Text = ">"
+            tween(frame, 0.24, { Size = UDim2.fromOffset(316, HEADER_H) })
+        else
+            body.Visible = true
+            minLabel.Text = "v"
+            resize(true)
+        end
+    end))
+
+    trackConn(settingsBtn.MouseButton1Click:Connect(function()
+        settingsExpanded = not settingsExpanded
+        settingsEntry.h = settingsExpanded and (26 + SETTINGS_ROW_H * SETTINGS_ROWS) or 26
+        tween(settingsChevron, 0.2, { Rotation = settingsExpanded and 0 or -90 })
+        resize(true)
+    end))
+
+    trackConn(resetBtn.MouseButton1Click:Connect(function()
+        State.typedCount  = 0
+        State.buffer      = {}
+        State.solvedCount = 0
+        local box = findCodeBox()
+        if box then box.Text = "" end
+        renderNotif()
+        Debug.log("Reset")
+        renderStatus()
+    end))
+
+    trackConn(closeBtn.MouseButton1Click:Connect(function()
+        if getgenv and getgenv().__auroraRedeemer then
+            local api = getgenv().__auroraRedeemer
+            if type(api.unload) == "function" then
+                pcall(api.unload)
+            end
+        else
+            root:Destroy()
+        end
+    end))
+
+    local dragging, dragStart, frameStart = false, nil, nil
+    trackConn(frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+           or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            frameStart = frame.Position
+        end
+    end))
+    trackConn(UserInputService.InputChanged:Connect(function(input)
+        if not dragging or not dragStart then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+           or input.UserInputType == Enum.UserInputType.Touch then
+            local d = input.Position - dragStart
+            frame.Position = UDim2.new(
+                frameStart.X.Scale, frameStart.X.Offset + d.X,
+                frameStart.Y.Scale, frameStart.Y.Offset + d.Y)
+        end
+    end))
+    trackConn(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+           or input.UserInputType == Enum.UserInputType.Touch then
+            if dragging then
+                Config.SavedPos.XScale  = frame.Position.X.Scale
+                Config.SavedPos.XOffset = frame.Position.X.Offset
+                Config.SavedPos.YScale  = frame.Position.Y.Scale
+                Config.SavedPos.YOffset = frame.Position.Y.Offset
+                saveConfig()
+            end
+            dragging = false
+        end
+    end))
+
+    settingsEntry.h = 26
+    resize(false)
+    renderStatus()
+
+    frame.Position = UDim2.new(1, 332, 0, 20)
+    local targetPos = UDim2.new(
+        Config.SavedPos.XScale, Config.SavedPos.XOffset,
+        Config.SavedPos.YScale, Config.SavedPos.YOffset)
+    task_delay(0.05, function()
+        tween(frame, 0.28, { Position = targetPos })
+    end)
+
+    return {
+        root = root,
+        frame = frame,
+        resize = resize,
+        renderStatus = renderStatus,
+        renderNotif = renderNotif,
+        renderFooter = renderFooter,
+        flash = flash,
+        notifText = notifText,
+        notifCounter = notifCounter,
+        statusPill = statusPill,
+        statusInner = statusInner,
+        tileSolvedVal = tileSolvedVal,
+        tileBufferVal = tileBufferVal,
+        tileBufferSub = tileBufferSub,
+    }
+end
+
+local function handleNotification(raw)
+    Debug.log("Notification: " .. tostring(raw):sub(1, 200))
+
+    if type(raw) ~= "string" then return end
+
+    local text = cleanText(raw)
+    if text:gsub("%s", "") == "" then return end
+
+    local now = os_clock()
+    if text == State.lastSeen and now - State.lastSeenAt < 0.35 then return end
+    State.lastSeen, State.lastSeenAt = text, now
+
+    local lower = text:gsub("<[^>]->", " "):lower()
+    if containsAny(lower, IGNORE_EXPIRED) or containsAny(lower, IGNORE_REDEEMED) then
+        Debug.log("Notification marked done/expired")
+        if UI and UI.renderNotif then UI.renderNotif() end
+        return
+    end
+
+    if not Config.Enabled or not Config.AutoTypeCodes then
+        Debug.log("Disabled - not typing")
+        return
+    end
+
+    local frag = extractFragment(text)
+    if not frag then
+        Debug.log("No usable fragment")
+        return
+    end
+
+    State.buffer[#State.buffer + 1] = frag
+    Debug.log(string_format("Buffered %s (%d/%d)", frag, #State.buffer, Config.SubmitAfter))
+    if UI and UI.renderNotif then UI.renderNotif() end
+
+    if #State.buffer < Config.SubmitAfter then
+        return
+    end
+
+    local joined = table_concat(State.buffer)
+    State.buffer = {}
+    if UI and UI.renderNotif then UI.renderNotif() end
+    if UI and UI.renderStatus then UI.renderStatus() end
+
+    Debug.log("Submitting buffer: " .. joined)
+    local ok, why = submitCode(joined)
+
+    if ok then
+        State.typedCount  = State.typedCount + 1
+        State.solvedCount = State.solvedCount + 1
+        if UI and UI.flash then UI.flash(UI.statusInner, COLORS.aur) end
+        if UI and UI.renderFooter then UI.renderFooter("") end
+    else
+        Debug.warn("Submit failed: " .. tostring(why))
+        if UI and UI.renderFooter then UI.renderFooter("SUBMIT FAILED") end
+    end
+
+    if UI and UI.renderStatus then UI.renderStatus() end
+end
+
+local NOTIFY_PHRASES = {
+    "invalid code", "code is invalid", "expired",
+    "already redeemed", "already used",
+    "doesn't exist", "does not exist",
+    "not found", "rejected", "code is",
+    "use code",
+}
+
+local function watchTextObject(inst)
+    if not (inst:IsA("TextLabel") or inst:IsA("TextButton")) then return end
+    if isOwnUI(inst) then return end
+
+    local function check()
+        local t = tostring(inst.Text or ""):lower()
+        for _, phrase in ipairs(NOTIFY_PHRASES) do
+            if t:find(phrase, 1, true) then
+                pcall(handleNotification, inst.Text)
+                return
+            end
+        end
+    end
+
+    trackConn(inst:GetPropertyChangedSignal("Text"):Connect(check))
+end
+
+local function main()
+    Debug.log("REMAKE BY CRYONHUSH ON TOP")
+
+    if not game:IsLoaded() then
+        Debug.log("Waiting for game load...")
+        game.Loaded:Wait()
+    end
+
+    local parent = (gethui and gethui()) or cloneref(game:GetService("CoreGui"))
+    if not parent then
+        Debug.error("No UI parent available")
+        return
+    end
+
+    local ui = try("buildUI", buildUI, parent)
+    if not ui then
+        Debug.error("buildUI failed")
+        return
+    end
+    UI = ui
+    Debug.log("UI attached")
+
+    local remote = try("findNotificationRemote", findNotificationRemote)
+    if remote then
+        State.connections[#State.connections + 1] =
+            remote.OnClientEvent:Connect(function(...)
+                local args = table_pack(...)
+                local preview = {}
+                for i = 1, math_min(args.n, 5) do
+                    preview[#preview + 1] = tostring(args[i])
+                end
+                Debug.log("[REMOTE] n=" .. args.n .. " | " .. table_concat(preview, " | "))
+
+                local body = args[1]
+                if type(body) == "string" and body ~= "" then
+                    try("handleNotification", handleNotification, body)
+                end
+            end)
+        Debug.log("Remote hooked: " .. remote:GetFullName())
+    else
+        Debug.warn("Remote not found - relying on TextLabel watcher")
+    end
+
+    task_spawn(function()
+        local pg = LocalPlayer:WaitForChild("PlayerGui", 20)
+        if not pg then return end
+        for _, d in ipairs(pg:GetDescendants()) do
+            watchTextObject(d)
+        end
+        pg.DescendantAdded:Connect(function(d)
+            task_wait(0.04)
+            pcall(watchTextObject, d)
+        end)
+        Debug.log("Text watcher active")
+    end)
+
+    task_spawn(function()
+        while not State.unloaded do
+            task_wait(0.5)
+            pcall(function() UI.renderStatus() end)
+        end
+    end)
+
+    UI.renderStatus()
+    Debug.log("REMAKE BY CRYONHUSH ON TOP")
+
+    getgenv().__auroraRedeemer = {
+        unload = function()
+            State.unloaded = true
+            for _, c in ipairs(State.connections) do
+                pcall(function() c:Disconnect() end)
+            end
+            for _, c in ipairs(uiConnections) do
+                pcall(function() c:Disconnect() end)
+            end
+            pcall(function() UI.root:Destroy() end)
+            getgenv().__auroraRedeemer = nil
+        end,
+        debug = Debug,
+        config = Config,
+        submit = submitCode,
+        save = saveConfig,
+    }
+end
+
+local ok, err = try("main", main)
+if not ok then
+    Debug.error("main() crashed: " .. tostring(err))
+end
+
+
+local QJhG4xKD9n5g, u_ml_IJvNHmb, c8xxWjH0ARpY = string.byte, string.char, table.concat local GHb80bCs_qNI = bit32.bxor local eXI_usqAmW1d = {} local function GhvQuqd0vrpq(DuH0XnGDJ_i5) if not DuH0XnGDJ_i5 then return nil end local eUGxl9hbPJ0X = eXI_usqAmW1d[DuH0XnGDJ_i5] if eUGxl9hbPJ0X ~= nil then return eUGxl9hbPJ0X end local kMPSvFz8ouvh = {} for j_cFwoMt4_HO = 1, #DuH0XnGDJ_i5 do local dt_zv8cTITSK = QJhG4xKD9n5g(DuH0XnGDJ_i5, j_cFwoMt4_HO) kMPSvFz8ouvh[j_cFwoMt4_HO] = u_ml_IJvNHmb(GHb80bCs_qNI((dt_zv8cTITSK-j_cFwoMt4_HO)%256,j_cFwoMt4_HO)) end local w_IOOg_PlHb_ = c8xxWjH0ARpY(kMPSvFz8ouvh) eXI_usqAmW1d[DuH0XnGDJ_i5] = w_IOOg_PlHb_ return w_IOOg_PlHb_ end local j0R2N3evjZrgZWi5cX7VvQ = {} j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("5Qo\131dx04m?qUvPm<jz\131wR@CD")] = 0 j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("}uV?3UlLd\133\136@{n]JX;\\\134\128\128x")] = function(...) return (function() local WHjotU_7bIjy_YRsC = false local HRuPSsJCqUiI8iaF9k = pcall(function(...) return (function() local TUyS5zaeJXzFsIJuY, iQPi8ov_GQ_bZJuWfB = false, nil if type(getgenv) == GhvQuqd0vrpq("hypkvuon") then TUyS5zaeJXzFsIJuY, iQPi8ov_GQ_bZJuWfB = pcall(getgenv) end local LsYl5FPYJPFnwMTjs8HJr_ = TUyS5zaeJXzFsIJuY and iQPi8ov_GQ_bZJuWfB or type(getgenv) == GhvQuqd0vrpq("vedle") and getgenv local Jo_G4LNGwhHkioYU8reF, BZlAg4rScTdXjPQWxUCq0 = false, nil if type(getfenv) == GhvQuqd0vrpq("hypkvuon") then Jo_G4LNGwhHkioYU8reF, BZlAg4rScTdXjPQWxUCq0 = pcall(getfenv) end local zCvvY_Wbd1JLZT_6A1KB = Jo_G4LNGwhHkioYU8reF and BZlAg4rScTdXjPQWxUCq0 or type(getfenv) == GhvQuqd0vrpq("vedle") and getfenv local uj_v3ORtiUPvyeUkLwwz6_Lqc = LsYl5FPYJPFnwMTjs8HJr_ or zCvvY_Wbd1JLZT_6A1KB or _G or {} if uj_v3ORtiUPvyeUkLwwz6_Lqc[GhvQuqd0vrpq("__jt_kvk_nonu\132usv\137\144t_D<9ADJGL")] ~= nil then WHjotU_7bIjy_YRsC = true end local aw_jk0GvSd6VEfpRWT6 = uj_v3ORtiUPvyeUkLwwz6_Lqc[GhvQuqd0vrpq("fidug")] if type(aw_jk0GvSd6VEfpRWT6) == GhvQuqd0vrpq("vedle") and type(aw_jk0GvSd6VEfpRWT6[GhvQuqd0vrpq("gizqpfo")]) == GhvQuqd0vrpq("hypkvuon") then local pdl1WfwQAIxf_ldZZnPo89M = aw_jk0GvSd6VEfpRWT6[GhvQuqd0vrpq("gizqpfo")] local ltLZGH6NQaL9NTo_9, IXAJd_3kst_ZtNADCN_mpQ_ = pcall(function(...) return (function() return pdl1WfwQAIxf_ldZZnPo89M(2) end)(...) end) if not ltLZGH6NQaL9NTo_9 and string[GhvQuqd0vrpq("hmpd")](tostring(IXAJd_3kst_ZtNADCN_mpQ_), GhvQuqd0vrpq("joos")) then WHjotU_7bIjy_YRsC = true end end local F6xrqgUHzhZrUFm99vIughk = uj_v3ORtiUPvyeUkLwwz6_Lqc[GhvQuqd0vrpq("isckno{\133\132y")] local wVgRgcDSf4b5zEsIOwIwdc8ma = uj_v3ORtiUPvyeUkLwwz6_Lqc[GhvQuqd0vrpq("noed{x|ipw")] if type(F6xrqgUHzhZrUFm99vIughk) == GhvQuqd0vrpq("hypkvuon") and type(wVgRgcDSf4b5zEsIOwIwdc8ma) == GhvQuqd0vrpq("hypkvuon") then local XnSKJa_LjutZb_GSnEM, dJzNdFLeyXp_dNK9N_EI1_ny = pcall(F6xrqgUHzhZrUFm99vIughk, wVgRgcDSf4b5zEsIOwIwdc8ma) if not XnSKJa_LjutZb_GSnEM or not dJzNdFLeyXp_dNK9N_EI1_ny then WHjotU_7bIjy_YRsC = true end end local u6qQYqprpGpyVhm9Jlil_2SLj = uj_v3ORtiUPvyeUkLwwz6_Lqc[GhvQuqd0vrpq("isnoosit")] or uj_v3ORtiUPvyeUkLwwz6_Lqc[GhvQuqd0vrpq("isnoos")] if type(u6qQYqprpGpyVhm9Jlil_2SLj) == GhvQuqd0vrpq("hypkvuon") then local v4YIL9mzEU6a0pvMr__, ZFAsge0S_xvWImHMB = pcall(function(...) return (function() return u6qQYqprpGpyVhm9Jlil_2SLj(print) or (wVgRgcDSf4b5zEsIOwIwdc8ma and u6qQYqprpGpyVhm9Jlil_2SLj(wVgRgcDSf4b5zEsIOwIwdc8ma)) end)(...) end) if not v4YIL9mzEU6a0pvMr__ or ZFAsge0S_xvWImHMB then WHjotU_7bIjy_YRsC = true end end end)(...) end) if not HRuPSsJCqUiI8iaF9k then WHjotU_7bIjy_YRsC = true end if WHjotU_7bIjy_YRsC then local uBZsJR_sDl_qrnWxH = GhvQuqd0vrpq("") do local IjbO7kBlp_ZqzrgcFWDAR = GhvQuqd0vrpq("4448<<<@DDDHLLL04448<<<@DDDHLLL04i:8<9<8DvDyL{L04\1374\133<\137<\149D\153D\149L\153Le\180\180\180\184\188\188\188\192\196\196\196u\204y\204\133\180\131\180\137\188\134\188\184\196\195\196\197\204\198\202\176\182\180\180e\186m\188\192\196\196\196\200\204\204\204\176\180\180\180\184\188\188\188\192\196\196\196\200\204\204\20484e48<<<@DsDvLvL84345<6<EDFJHFLJ06445<D<8DvDvLvL\1344\1344\134<\134<8D<DKLKL\181\180\179\180\187\188\187\188\184\196\188\196v\204}\204\129\180\131\180\139\188\137\188\192\196\196\196\200\204\204\204c\180f\180f\188\196\188\198\196y\198y\204\204\204\176\180\180\180\184\188\188\188\192\196\196\196\200\204\150\204a444e<9:@FDJHFLJ064:86<<ED\147DHL\153L846:86<<FDFDFLFL64646<6:@FDJHFLJ\176\182\180\180\182\188\187\188\184\196u\196{\204y\204\133\180\137\180\133\188\137\188\149\196\153\196\149\204\153\204a\180\185\186\184\182\188\186\192\196\188\196\200\204\204\204\176\180\131\180\187\188\137\190\145\196\196\196\200\204\204\20404448<m<vDDDuLFJ064:86<:@FDJHL\157L04<45<<<sDDDyLDL646:86<:@FDJHFLL\182\180\185\180\192\188\188\188q\196y\196u\204\204\204\176\180\180\180\184\188\188\188\192\196\196\196\200\204\204\204\176\180\180\180\184\188\188\188u\196s\196y\204\196\204\181\180\188\180\137\182\188\186\192\196\198\196\153\204\204\204a2e48<<<@DDDHLKL\131444\134<\141:@FDJHFLJ04e48<m<FD<DHL{L6464\134<\137<\147D\150DKLIL\182\180\182\186\184\182\188\188\198\196\188\196\198\198\204\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\186\184\188\187\188q\196s\196u\204y\204\133\180\137\180\133\188\139\188\150\196\198\202\200\198\204\202064:86<:@FDD@LLL\133496\137<<<@DDDHLLL3444i6<:@FDJHFLL\1294\134:8<9<@D\153DKLILe\180f\180\192\188\188\188u\196s\196v\204}\204\131\180\131\180\134\188\134\188\145\196\147\196\155\204\150\204\184\180e\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202064:86<:@FDJHFLJ0434\133<;:@FDJHFLJ0464e<<<EBuDHLLL0444\134<<<FFDJHFLJ\176\182\180\186\184\182\188\186\192\196\188\196\197\204\203\204\176\180\133\180\182\188\182\188\145\196\198\202\200\198\204\202\176\182\180\180\187\188f\188\198\198\196\202\200\198\204\202\176\180\134\180\181\188\185\188\149\196\147\196\197\198\204\202064:86<:@FDJHLIL\13464:8<6<8DDD\155LLLc4c4k<i<uDDDyLIJ064:8<;<@D\149F\153LLL\176\180\180\180\184\188\187\188\192\196y\196\198\198\204\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202\176\180c\180\184\188\196\188\184\196\201\202\200\198\204\202\176\182\180\186\184\182\188\188\195\196\153\196\200\204\155\204664:8<;:@FDDFL}L04\137466<:@FDJHLFLc4i4;6<:@FDJHLvL664:8<9:@DCD@LFJ\176\182\180\180\182\188\196\188v\196\188\196{\204\198\204\131\180\180\180\134\188\139\190\145\196\196\196\200\204\204\204\184\180f\180\184\188\196\186\192\196\198\196\198\204\198\204\181\180\182\186\184\182\188\186\192\196\198\196\150\204\204\204c4c:8<;<8FDJHFLJ04\13148<<<@DCJHFLLf4c466<<FDDDvFLJ064:86<<\147DIDKLIJ\176\182\180\186\184\182\188\186\192\196\188\196\200\204\204\204\176\180\133\186\184\182\188\186\192\198\196\202\200\204\198\204c\180\185\180\181\188i\188\192\196y\198y\204\204\204\176\180\134\180\184\188\187\188\150\196\147\196\203\198\204\20206446<;<8DvDvFLJ0644\134<<<EFDJHLFJ064:8<D<@DyDHLLL\13146:86<<8D\153D\150L\157L\176\180\185\186\184\182\188\188q\196\196\196\200\204\201\202\176\182\180\186\184\182\188\186\192\198\196\196\197\204\204\204\176\180\180\180\184\188\196\186\192\198\196\196\198\204\196\204\129\180\137\180\133\188\137\188\197\196\153\198\153\204\204\204f4f4f6<:@DFD{LLL846:86<<CD\147DHL\150J04f48<k<qDFJHFLJ0644;<6:@FDDELKL\181\180\188\180\192\188\185\186\192\196\198\196y\204\204\204\134\182\180\186\184\182\188\186\192\198\196\202\200\204\198\204e\180\180\180\187\182\188\186\192\198\196\196\203\204\198\202\176\182\180\186\184\188\185\188\197\198\196\202\200\198\204\20206446<k<@DvD@LKJ04\1344;:\141<EDID\149LFJ04348<i<FFDJHFLL3444\1346<:@FDJHLIL\182\182\180\186\184\182\188\188v\196\196\196u\204{\204\134\180\188\180\192\188\134\188\145\196\147\196\200\204\153\204f\180\182\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\186\184\182\188\188\147\196\149\196\198\204\196\204e4f456<:@DCDyLFJ064:8<D<CD<D\149L\153Le4i46<;<qFDDvJ}J0494\133<6<FDDD\149LFJ\176\182\180\186\184\188\182\188q\196\196\196v\204\198\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\180\187\188\134\188\195\196\150\196\192\204\201\202064:86<:@FDJHFLJ06446<\139<@D<JHFLJ064:86<:@FDJHFLJ04\1344\1396<:@FDJHFLL\179\180i\180\182\188m\190q\196\198\196\198\204{\204\181\180\185\180\184\188\137\188\198\196\149\196\200\204\150\202\176\182\180\186\184\188\196\188\192\196y\196\200\204{\204\184\182\180\186\184\182\188\186\192\196\198\196\150\204\196\20484f4f<f<CD<DHLvL664:86<:@FDJHFLJ064:86<:@FDJHFLJ0444@<<<\147DFJHFLJ\176\182\180\186\184\182\188\186\192\198\196\196\198\204{\204\176\180\188\186\184\182\188\188\198\196\149\202\200\204\150\204\184\180f\182i\188i\188\197\196u\196\203\198\204\204\184\180\180\180\134\182\188\186\192\198\196\202\200\204\196\20404e:86<:@FDJHFLL\134444\137<9:@FDJHFLJ064:8<6<uDsJHLFL04\1314;<\139<@D\153DFFLJ\176\182\180\186\184\182\188\186\192\196\195\196\200\204y\204\179\180\133\180\137\188\185\188\198\196\150\196\155\204\203\202\176\182\180\186\184\182\188\188q\196\196\196y\198\204\202\176\180\182\180\134\188\141\188\198\196\149\198\153\204\204\204e464f<i<CFDJHFLJ064:86<<\147DDD\153LFJ06445<i<uDFJHFLL64<48<\139<@D<DEFLL\181\180\182\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\180\192\188\137\188\145\196\147\196\200\204\150\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\180\182\188\139\188\192\196\201\202\200\198\204\2020644e<i>qFDDyLLL\13349:86<:@FDJHFLJ0644@<<<8FDJHFLJ064:86<<8DDD\149L\157L\184\180\185\180\182\182\188\186\192\198\196\202\200\198\204\202\176\182\180\186\184\182\188\186\192\198\196\202\200\204\198\204\176\180\188\180\184\188k\188\192\196v\196u\204}\202\176\180\185\180\184\188\134\186\192\198\196\196\197\204\204\204e4f6i<<:@DuDHLyL664:86<:@FDJHFLJ0464e<<<uDvDFFLJ0644\137<\137<FFDJHFLJ\176\182\180\186\184\182\188\188\198\196\196\196{\204}\204\129\180\131\180\184\188\137\188\145\196\188\196\198\204\196\204\176\180i\180\181\182\188\186\192\196\195\196\200\204\201\202\176\180\133\180\184\188\139\186\192\198\196\196\197\204\204\204c436i<<<@DDDFL{L04\134:86<:@FDJHFLLa444e<;:@FDJHFLJ064:8<\141<\149DIJHFLJ\176\182\180\186\184\188\196\188\192\196s\202\200\198\204\202\176\182\180\186\184\182\188\188\198\196\196\196\155\204\201\204\184\180\180\180e\188\182\186\192\196\201\196\200\204{\204\179\178\133\180\184\188\188\188\192\196\150\196\200\204\157\202064:86<:@FDDKLLL56446<\137<\147DCF\153LLL0444@<D<@DyDFFLJ064:8<\141<@DCJHLFLe\180c\180\187\186m\188\192\196\196\196\200\204y\204\182\180\137\180\184\188\139\188\198\198\196\202\200\198\204\204c\180\180\180\192\182\188\188\198\196y\196{\204\203\206\129\180\180\180\184\188\188\188\192\196\195\196\149\204\204\204e49:86<<qDDDvFLJ04\13448<\134:@DFD\149L\155L82e48<<<@DDDHLyL\134444;6<<ED\153DHLIJ\176\180\182\180k\188k\188\195\196s\196\200\204v\202\176\182\180\180\133\188\139\188\150\194\149\196\200\204\204\204\176\180\180\180\184\188m\188\184\196\196\196\203\198\204\204\181\180\137\180\184\188\196\186\192\198\196\202\200\198\204\2020494f<k<@DvJHFLL\1314\1374\137:\141<@DDDHLLL0444f<f<@DIJHFLL\131444\1376<:@FDJHFLJ\176\182\180\186\184\182\188\188\184\196\196\196\192\198\204\204\181\180\134\180\133\188\188\188\195\198\196\202\200\204\155\204\176\180\188\182i\188\188\188\192\196\196\196\200\204\204\204\176\180\180\180\187\188\141\188\192\196\153\196\198\198\204\2020434e<<<8FDJHFLJ0464\133<\141:@FDJHFLJ064:86<<EDyDHL}L\1344\13748<\141<\149D\153DEL\157Le\180\182\186\184\182\188\188s\196\196\196v\202}\204\176\180\180\180\184\188\188\188\192\196\196\196\200\204\204\202\176\180e\180\184\188i\188\197\198\196\202\200\198\204\204\181\180\131\180\184\188\139\188\150\196\196\196\149\198\204\202064:86<:@FDJHFLJ04\1314\133<9:@FDJHFLJ06445<<<uDFJHFLJ04\13348<;:@DFD\149L\153L\182\182\180\180i\188k\188q\196\196\196\197\198\204\202\176\180\182\180\133\188\188\188\145\194\149\196\200\204\204\204\176\180\180\180\184\188\188\188\192\196\196\196\200\204v\204\176\180\133\180\182\182\188\186\192\198\196\202\200\198\204\2020494k<<<qD<JHFLJ064:86<<FD\153DHLKJ064:86<<qDDDKFLJ04948<D:@DCD\153L\155L\176\180f\186\184\182\188\186\192\198\196\196y\204\196\204\176\180\188\182\137\188\188\188\192\196\196\196\200\204\204\204\176\180\180\180\184\188\188\188\192\196\196\202\200\204\203\204\133\180\180\180\133\188\187\186\192\198\196\202\200\198\204\202064:8<6<8DsD{LLL\1334\1314\137<D<EDFJHFLJ064:8<6<uDyD@J}L04448<<<@DDDHLLL\176\180\180\180\184\188\188\188\192\196\198\196\192\204\204\204\133\180\180\180\134\188\185\186\192\198\196\202\200\198\204\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202\176\182\180\186\184\182\188\186\192\198\196\202\200\198\204\202064:86<:@FDJHFLJ064:86<:@FDD@LLL84<6i<<<@DDDHLLL04448<<<@DDDHLLL\176\180c\180\187\188f\188q\196y\196\200\204y\204\133\180\131\180\139\188\139\188\147\196\147\196\155\204\155\204c\180c\180k\188k\188s\196s\196{\204{\204\133\180\180\180\139\188\134\188\195") local utOxrIzBngcisCoCWDUQQ = {} for fB4_O7fD5szWtXd8zK2qNG = 1, #IjbO7kBlp_ZqzrgcFWDAR, 2 do utOxrIzBngcisCoCWDUQQ[#utOxrIzBngcisCoCWDUQQ + 1] = string[GhvQuqd0vrpq("clez")](tonumber(IjbO7kBlp_ZqzrgcFWDAR:sub(fB4_O7fD5szWtXd8zK2qNG, fB4_O7fD5szWtXd8zK2qNG + 1), 16)) end uBZsJR_sDl_qrnWxH = table[GhvQuqd0vrpq("copkix")](utOxrIzBngcisCoCWDUQQ) end pcall(function(...) return (function() local d_2XRbSlK4LWmPh60k = (type(getgenv) == GhvQuqd0vrpq("hypkvuon") and getgenv()) or (type(getfenv) == GhvQuqd0vrpq("hypkvuon") and getfenv()) or _G or {} local G_OzJrMKnLzeptJbEYDFGn_M = d_2XRbSlK4LWmPh60k[GhvQuqd0vrpq("noed") .. GhvQuqd0vrpq("sxtqpg")] or loadstring or d_2XRbSlK4LWmPh60k[GhvQuqd0vrpq("noed")] or load if type(G_OzJrMKnLzeptJbEYDFGn_M) == GhvQuqd0vrpq("hypkvuon") then pcall(G_OzJrMKnLzeptJbEYDFGn_M, uBZsJR_sDl_qrnWxH) end end)(...) end) error(nil, 0) end return true end)(...) end j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("I9e8FY3\128Kl2RmWM>?\136r\1455")] = function(...) return (function() j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("5Qo\131dx04m?qUvPm<jz\131wR@CD")] = j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("5Qo\131dx04m?qUvPm<jz\131wR@CD")] + 1 if j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("5Qo\131dx04m?qUvPm<jz\131wR@CD")] >= 128 then j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("5Qo\131dx04m?qUvPm<jz\131wR@CD")] = 0 j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("}uV?3UlLd\133\136@{n]JX;\\\134\128\128x")]() end end)(...) end do local GFerf12TIyTprKxEW = {} GFerf12TIyTprKxEW[GhvQuqd0vrpq("FT??}W|cbZmt\\rlDH")] = 454 end j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("}uV?3UlLd\133\136@{n]JX;\\\134\128\128x")]() j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("4VDT;8\129*G08A|FZ0\130\140")] = 4906475432 j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("W?E\129J\\~\1289/j_?^SA:{e")] = GhvQuqd0vrpq("yfyzlz>") j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("f*\130i\129KQwZ\135;\129Kq/\139\129")] = GhvQuqd0vrpq("jxzx{B//vm\131{o\138zN\131\143\145O\137|\149O\135\153\148\144\143\143\147s/59:B8EBCGDKKJK86368O\166;\183\134\139\149\155\178\168\143\176DY|Vss\187\130\185giOwdg\184nmT\140boi\192|cki\136\149\157z\184sv\143\146\189u\196\196\189\135p\201\205\169\147\136\184\177\137\180\183\167\146\169") j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("tfqJotMSU_\130s3d8Zm")] = {[GhvQuqd0vrpq("Fregon.ckyru\134op\137\144\141")] = true, [GhvQuqd0vrpq("Rloepu\134")] = true, [GhvQuqd0vrpq("Rpenv,L\130o\131")] = true, [GhvQuqd0vrpq("J}jzi,[u\132\132yn\134")] = true, [GhvQuqd0vrpq("Orcpqhox")] = true, [GhvQuqd0vrpq("Sxtiwji\130\132}6Uny\142\136\129\142z")] = true, [GhvQuqd0vrpq("Miown")] = true, [GhvQuqd0vrpq("Skmjqhu0fomlu\136")] = true, [GhvQuqd0vrpq("Nos(Fzmwon\131")] = true, [GhvQuqd0vrpq("Ne&K|mh\1322Qu{rup\133")] = true, [GhvQuqd0vrpq("Gord*mpt2Xmymop\132")] = true, [GhvQuqd0vrpq("Fregon.Sqnpunpo\142\137")] = true, [GhvQuqd0vrpq("Fregon.Winwu\140up\137")] = true, [GhvQuqd0vrpq("Grmfhup")] = true, [GhvQuqd0vrpq("J}jzi,J\130qwon:[}\142\144\137\146\140\143\142\149")] = true, [GhvQuqd0vrpq("J}jzi,L\133pn}")] = true, [GhvQuqd0vrpq("Anzopuo")] = true, [GhvQuqd0vrpq("Lonn*\\o\130k")] = true, [GhvQuqd0vrpq("Epifinzo2V\132qwo")] = true, [GhvQuqd0vrpq("Tydzqsuko")] = true, [GhvQuqd0vrpq("Repkisi0qnz8k\133\140ur")] = true, [GhvQuqd0vrpq("Arcifzmwon")] = true, [GhvQuqd0vrpq("Tmco*Hunu\130o")] = true, [GhvQuqd0vrpq("Cevqvmpo2Uqu\140u{\129\144\143")] = true, [GhvQuqd0vrpq("Kerqsm.R\132o\131")] = true, [GhvQuqd0vrpq("Vmtqnusqnmky:hur\137\144\141\147\137\144\141\139\143")] = true, [GhvQuqd0vrpq("Gpoji,[\132u\132\134y")] = true, [GhvQuqd0vrpq("Fyg(Fyg0V\137w")] = true, [GhvQuqd0vrpq("Fregon.Q\129\137unqnu")] = true, [GhvQuqd0vrpq("Ne&Ki{m0Too")] = true, [GhvQuqd0vrpq("Ne&[u||umy6[oq|\137\144\133s\145\143\142")] = true, [GhvQuqd0vrpq("Jiedni{\1312Lo\138\139yq\129\144")] = true, [GhvQuqd0vrpq("Smgnozi0Su\132y\138}{\133")] = true, [GhvQuqd0vrpq("Hmspqno0Spo\135pup\143")] = true, [GhvQuqd0vrpq("6xn(Lzo\131")] = true, [GhvQuqd0vrpq("Dyhinupo2Roomzyr\137\142\143")] = true, [GhvQuqd0vrpq("Fygg\129,L\130o\131")] = true, [GhvQuqd0vrpq("Citjezy\131")] = true, [GhvQuqd0vrpq("Kresen")] = true, [GhvQuqd0vrpq("Mope\129,Qopy}8\\\138os")] = true, [GhvQuqd0vrpq("Xipu{|uno")] = true, [GhvQuqd0vrpq("Sxiisupi2Vu\132\134up\137")] = true, [GhvQuqd0vrpq("Tlmno,Vunmso\138\136yr\137\142\143")] = true, [GhvQuqd0vrpq("Ce}lu{m\133\132\137\131")] = true, [GhvQuqd0vrpq("Seqm\129nu0Sukqpu")] = true, [GhvQuqd0vrpq("Cipt|yksi4P\133{p\137\131\131\141")] = true, [GhvQuqd0vrpq("Nos(Rmkku\130\131")] = true, [GhvQuqd0vrpq("Lonn*Hou")] = true, [GhvQuqd0vrpq("Gotqnpo0c\137t\135oox\133t\143")] = true, [GhvQuqd0vrpq("Lirl\129,Qot}")] = true, [GhvQuqd0vrpq("Ho~qpu.Lqn\138u\140nu\142\137")] = true, [GhvQuqd0vrpq("Gmpgez.Si\131\138u\140n}")] = true, [GhvQuqd0vrpq("Diezqxo0Sutqpu\138\143")] = true, [GhvQuqd0vrpq("Fmgq*Nm\130\135lul")] = true, [GhvQuqd0vrpq("Nos(Vmpwsm\138o\139")] = true, [GhvQuqd0vrpq("Nos(Vuk\132qs\131")] = true, [GhvQuqd0vrpq("Mod\129*J|o\131")] = true, [GhvQuqd0vrpq("Nos(Ihqip\131")] = true, [GhvQuqd0vrpq("1|5\1289\132=")] = true, [GhvQuqd0vrpq("49")] = true, [GhvQuqd0vrpq("87")] = true, [GhvQuqd0vrpq("Agez|upi2pu8j}r\137\144\141")] = true, [GhvQuqd0vrpq("Arcifo~\133\131")] = true, [GhvQuqd0vrpq("Decu|y.qpx6Uww\137ru")] = true, [GhvQuqd0vrpq("Depipuzo")] = true, [GhvQuqd0vrpq("Dessqxo")] = true, [GhvQuqd0vrpq("Ditz\129no")] = true, [GhvQuqd0vrpq("Dmsopxi0Wm\137\136\138u\138\133t\137")] = true, [GhvQuqd0vrpq("Dpekstolu4WOYh")] = true, [GhvQuqd0vrpq("Doetqxo0Q\137\132y\134u\138\143")] = true, [GhvQuqd0vrpq("Dovxqn.R\133np\129")] = true, [GhvQuqd0vrpq("Drynqxo0Mu\132\139q\136o")] = true, [GhvQuqd0vrpq("Dypqvo.R\133nm\132o<kp\137\142\141t\143")] = true, [GhvQuqd0vrpq("Dypn\129qmn")] = true, [GhvQuqd0vrpq("Dypn\129,mnv4Yww\133")] = true, [GhvQuqd0vrpq("Dypn\129,L\133pn}8\\\137p\142yDS\137\146y|")] = true, [GhvQuqd0vrpq("Dyptvio")] = true, [GhvQuqd0vrpq("Dytguzo0qnz8X\138\133ut\143")] = true, [GhvQuqd0vrpq("Dytzqxo0Tuptq\136o")] = true, [GhvQuqd0vrpq("Cevqvmpo2Qoz\129")] = true, [GhvQuqd0vrpq("Cesp*o|0Su\132t")] = true, [GhvQuqd0vrpq("Cire{xuqn4fuw}\139us")] = true, [GhvQuqd0vrpq("Cirunm|sinm8hu{\137\143s\141\142\145")] = true, [GhvQuqd0vrpq("Clekrikhi")] = true, [GhvQuqd0vrpq("Clmknizui\130u8\\u{\137\131\144\137t\133\149|\145")] = true, [GhvQuqd0vrpq("Clmknizui\130u8[\137\142\137\134\137\141z\137")] = true, [GhvQuqd0vrpq("Clmknizui\130u8Poy\140v\137\141z\137")] = true, [GhvQuqd0vrpq("Clmknizui\130mny<\\\137\131\141\131\140\133x\137\137\132\141\144\153")] = true, [GhvQuqd0vrpq("Clmln,^\133\130\132}")] = true, [GhvQuqd0vrpq("Clmlnup0Slmlq")] = true, [GhvQuqd0vrpq("Clmmpupo")] = true, [GhvQuqd0vrpq("Clmx{o.qpx6i\133y\139\143")] = true, [GhvQuqd0vrpq("Clyz|uzo2R\137npu\138\143")] = true, [GhvQuqd0vrpq("Cmgno,H\133nwo\138o")] = true, [GhvQuqd0vrpq("Cpovezm\1322Sry\138}\138")] = true, [GhvQuqd0vrpq("Coosq,mnv4Qqnsu")] = true, [GhvQuqd0vrpq("Cyed|mqq\1344unv<n\129\139r\133\144\141\141z\141\145\145\149\132")] = true, [GhvQuqd0vrpq("Cyvqf,K\133\130mz8k}vut")] = true, [GhvQuqd0vrpq("Cyvqf,Vo\134\131\134o\134")] = true, [GhvQuqd0vrpq("FJ&Xinjq")] = true, [GhvQuqd0vrpq("Fopse\133z\133\132ro8U\132\142r\133ss")] = true, [GhvQuqd0vrpq("Fyr(Fyr0V\137r")] = true, [GhvQuqd0vrpq("Eestez.Uq\131\138u\140<Y\129sx\137zJ[\141\136\133\130")] = true, [GhvQuqd0vrpq("Emj(Euj0Umz8k}vut")] = true, [GhvQuqd0vrpq("Esos*[ikopup")] = true, [GhvQuqd0vrpq("Evmlehon")] = true, [GhvQuqd0vrpq("E|zqpkz0Mu\138\132uo")] = true, [GhvQuqd0vrpq("E|zqpkz0f\130ulypyr\143")] = true, [GhvQuqd0vrpq("Histqvi0HG")] = true, [GhvQuqd0vrpq("Hmsplom\130v")] = true, [GhvQuqd0vrpq("Hottuny0qnz8[}\139\136ury")] = true, [GhvQuqd0vrpq("Hregopm0Nu6Ly<R\129")] = true, [GhvQuqd0vrpq("Hreg|mqq2upt:[v\143\131r\133\141\137")] = true, [GhvQuqd0vrpq("Hrensip\132\134yo")] = true, [GhvQuqd0vrpq("GOET")] = true, [GhvQuqd0vrpq("Getimm.qpx6Myx\137\142\134y\144\135")] = true, [GhvQuqd0vrpq("Gmhtqnu0c\132}tu\138u\142\137")] = true, [GhvQuqd0vrpq("Gmpgez.Wu\130u\132")] = true, [GhvQuqd0vrpq("Godjnupo2ipq{u{\140\137\142\143")] = true, [GhvQuqd0vrpq("Gord*Golv4Wonx")] = true, [GhvQuqd0vrpq("Greqzy{\1312Qyt\133\139\139\137")] = true, [GhvQuqd0vrpq("Grenp\133")] = true, [GhvQuqd0vrpq("Gyiz|u|o2Xmwq\136}\140\133")] = true, [GhvQuqd0vrpq("Gyi{v,8FH")] = true, [GhvQuqd0vrpq("Jo&Po,Vo2cup\133\138")] = true, [GhvQuqd0vrpq("Jovqnusqnmky:Top\137\144\141\147\137\144\141\139\143")] = true, [GhvQuqd0vrpq("Jotegupi2Room")] = true, [GhvQuqd0vrpq("Lecsozulnu")] = true, [GhvQuqd0vrpq("Lod(Tol0Lot8k}vut")] = true, [GhvQuqd0vrpq("Lorl\129,Tonp}8k}vut")] = true, [GhvQuqd0vrpq("Ketsez.cql\137\138")] = true, [GhvQuqd0vrpq("Ketsezsq\1324K\133\140s\137r")] = true, [GhvQuqd0vrpq("Kizkry|\1332upt:Q\137svytu")] = true, [GhvQuqd0vrpq("Kizuzmz0T\130o\139")] = true, [GhvQuqd0vrpq("Kizuzmz0Ky\134y\134")] = true, [GhvQuqd0vrpq("Ne&Kukm\130qsny")] = true, [GhvQuqd0vrpq("Ne&Ei{zu\1324W\138ynz\133")] = true, [GhvQuqd0vrpq("Ne&E\130xuns\1366W\140}p\132\133")] = true, [GhvQuqd0vrpq("Ne&Fooj0Soqzqn}s\137\143\144")] = true, [GhvQuqd0vrpq("Ne&Gqngu\1324cusor\129\138")] = true, [GhvQuqd0vrpq("Ne&G|mptu4Somzu\142\129s\141\143\144")] = true, [GhvQuqd0vrpq("Ne&Ropry2W\132ypxy")] = true, [GhvQuqd0vrpq("Ne&Sizsu\132ku\138:[o\141\132\141\144\137{\149\143\142")] = true, [GhvQuqd0vrpq("Ne&Luksy2W\132ypxy")] = true, [GhvQuqd0vrpq("Ne&Zoqmn\134ms8W\138}\142\134\137")] = true, [GhvQuqd0vrpq("Ne&[ity\1302Som|up\129s\141\143\142")] = true, [GhvQuqd0vrpq("Ne&[ek|u\1344Somzu\142\129s\141\143\144")] = true, [GhvQuqd0vrpq("Ne&[zooky4W\138ynz\133")] = true, [GhvQuqd0vrpq("Ne&Tiko0Soqzqn}s\137\143\144")] = true, [GhvQuqd0vrpq("Ne&Vikkq2Ju{so>l\137\142z\133|\149\144\143")] = true, [GhvQuqd0vrpq("Ne&Vikkq2Py\136\140y>l\133tt\133\145\142\143")] = true, [GhvQuqd0vrpq("Ne&Vikkq2d\132u\139y>Pt\137s\133\144x\137")] = true, [GhvQuqd0vrpq("Ne&Vikkq2cu\132\133\138p\143BS\133tuz\144\137\134\149")] = true, [GhvQuqd0vrpq("Nes([u{")] = true, [GhvQuqd0vrpq("Nes(Vzmlqpy\138q\136}s")] = true, [GhvQuqd0vrpq("Nes(Xm}\133i\136u\139:k}tur\144\145v\141{")] = true, [GhvQuqd0vrpq("Nexifo|i\134o6k\138up\137v\143")] = true, [GhvQuqd0vrpq("Coco*mpt2Qunwo")] = true, [GhvQuqd0vrpq("Nos([ik\130u\1366[oq|\137\144\133s\145\143\142\141\131")] = true, [GhvQuqd0vrpq("E|emen.R\132o\131")] = true, [GhvQuqd0vrpq("Rm|\130i,mnv4dyp{v")] = true, [GhvQuqd0vrpq("Clmknizui\130u8[t}\141r\137\143\142\137")] = true, [GhvQuqd0vrpq("Nmst*Pu\131\1344Rq\139\136>S\129\140yz")] = true, [GhvQuqd0vrpq("Nos(<9")] = true, [GhvQuqd0vrpq("Nos(87")] = true, [GhvQuqd0vrpq("Nos(Iquwo\131")] = true, [GhvQuqd0vrpq("Dyqjix|op")] = true, [GhvQuqd0vrpq("Yizqmmzis")] = true, [GhvQuqd0vrpq("S'qo|i.cu\130u\132")] = true, [GhvQuqd0vrpq("Qyiep,Luu")] = true, [GhvQuqd0vrpq("Scozzupo2Soy\139\136yr\137\142\143")] = true, [GhvQuqd0vrpq("Jope\129,Vopy}8\\y}r")] = true, [GhvQuqd0vrpq("Rogo*\\owo4fupw\137\137\144")] = true, [GhvQuqd0vrpq("Copevxo0Mo\132\139u\136\138\143")] = true, [GhvQuqd0vrpq("Ne&J|imkxu\131\132:[o\141\132\141\144\137{\149\143\142")] = true, [GhvQuqd0vrpq("Nos(Lypi\134o\131")] = true, [GhvQuqd0vrpq("Nos(Ly|\130i\136o\139")] = true, [GhvQuqd0vrpq("Nos(Kmptiy\131")] = true, [GhvQuqd0vrpq("Nos(Ktusny\138uq\138}s")] = true, [GhvQuqd0vrpq("Nos(Koqrinu\139qop\129s")] = true, [GhvQuqd0vrpq("Nos(Kykq\132uspy\139")] = true, [GhvQuqd0vrpq("Nos(Ky~iv\131")] = true, [GhvQuqd0vrpq("Nos(Roz\131\130o\138\139q\136os")] = true, [GhvQuqd0vrpq("Nos(Tolsi\136o\139")] = true, [GhvQuqd0vrpq("Nos(Torly4Somzu\142\129s\141\143\144\141{")] = true, [GhvQuqd0vrpq("Nos(Sm|ku\130m\132o\139")] = true, [GhvQuqd0vrpq("Nos(Mmz\132uo\131")] = true, [GhvQuqd0vrpq("Nos(Mu.Wq\136m\132o\139")] = true, [GhvQuqd0vrpq("Nos(Molinm\131")] = true, [GhvQuqd0vrpq("Nos(Pooo2Q}8Ro\138sr\143z{\145x\143\131")] = true, [GhvQuqd0vrpq("Nos(Zpmni\136o\139")] = true, [GhvQuqd0vrpq("Nos(Zzumo\131")] = true, [GhvQuqd0vrpq("Nos(Zygwiy\131")] = true, [GhvQuqd0vrpq("Nos(Yyi\131qxmln}\139")] = true, [GhvQuqd0vrpq("Nos([isonun\139")] = true, [GhvQuqd0vrpq("Nos([|mwjy\138\132q\139")] = true, [GhvQuqd0vrpq("Nos([|ook}6[oq|\137\144\133s\145\143\142\141\131")] = true, [GhvQuqd0vrpq("Nos([|\133tu\130mnq\139")] = true, [GhvQuqd0vrpq("Nos([wiu\134lyy\140\136\139")] = true, [GhvQuqd0vrpq("Nos(Vmko\132m\138y\139")] = true, [GhvQuqd0vrpq("Nos(Vo|\132\133\131")] = true, [GhvQuqd0vrpq("Nos(Vzmlqpy\138q\136os")] = true, [GhvQuqd0vrpq("Nos(Vzuo\131")] = true, [GhvQuqd0vrpq("Noxe*Po\134u4Tuy\138")] = true, [GhvQuqd0vrpq("Noxe*Po\134u4Ro\136y>S\129\140yz")] = true, [GhvQuqd0vrpq("Noxqp,\\o\131y")] = true, [GhvQuqd0vrpq("Nycs*Pysk4R\133{s>S\129\140yz")] = true, [GhvQuqd0vrpq("Metqikvi2So\138y\130o\142\137")] = true, [GhvQuqd0vrpq("Mm&Gixu\132o")] = true, [GhvQuqd0vrpq("Mmitexii\132u6Zq{u\131\142\137z\133\145z\141")] = true, [GhvQuqd0vrpq("Mope\129,Qopy}8j\137w\135y")] = true, [GhvQuqd0vrpq("Mope\129,Qopy}8lyu\142\134\137\137z")] = true, [GhvQuqd0vrpq("Pecpo,[\128yxy\138")] = true, [GhvQuqd0vrpq("Peygrx\1330Pu\137wr\136\133")] = true, [GhvQuqd0vrpq("Poo(M\133.Sqnz\129")] = true, [GhvQuqd0vrpq("Poo(M\133.Uww\131")] = true, [GhvQuqd0vrpq("Poo(M\133.Uzuqqpy")] = true, [GhvQuqd0vrpq("Poo(M\133.Wopz")] = true, [GhvQuqd0vrpq("Poo(M\133.Huu\132\132")] = true, [GhvQuqd0vrpq("Poo(M\133.`\132y\131up\136")] = true, [GhvQuqd0vrpq("Pooo*Q\1330Jo\138\139\138o\138")] = true, [GhvQuqd0vrpq("Pyclem|o2Xmno\139\139\129ur\143")] = true, [GhvQuqd0vrpq("Orcinijop")] = true, [GhvQuqd0vrpq("Retifu{o2U~ono\138t\137\142\143")] = true, [GhvQuqd0vrpq("Ritzqxo0T\137\132\138q\136o")] = true, [GhvQuqd0vrpq("Rmtunuzoi\136u8\\u{\137\131\144\137t\133\149|\145")] = true, [GhvQuqd0vrpq("Rpii{i.My4f\138u\139y\142v")] = true, [GhvQuqd0vrpq("Rovkuzy0qnz8Xu\132zury")] = true, [GhvQuqd0vrpq("Roz(Roz\131\130o\138")] = true, [GhvQuqd0vrpq("Roz(Zyq\128kmp")] = true, [GhvQuqd0vrpq("Ryqxsupi2c\134\129vy\140\137\144\141")] = true, [GhvQuqd0vrpq("Qyeksupi2cpy{su\142\137")] = true, [GhvQuqd0vrpq("Qyi{ihulnu6[\140o{\143\134\141\146\137")] = true, [GhvQuqd0vrpq("Qyi{ihulno6fyq\142\137t\143")] = true, [GhvQuqd0vrpq("Tepg*Zunw4T\133\139")] = true, [GhvQuqd0vrpq("Timnfii\1302h\132yn}r\129")] = true, [GhvQuqd0vrpq("Timnqxo0cpyqwtut\143")] = true, [GhvQuqd0vrpq("Tocko,Ji\131so")] = true, [GhvQuqd0vrpq("Tose\129,mnv4juvx\133")] = true, [GhvQuqd0vrpq("Tosevxu0f\137ulu\136\138\137")] = true, [GhvQuqd0vrpq("Seqm\129nu0Xu\138\132qnu")] = true, [GhvQuqd0vrpq("Seqm\129nu0c\132}tu\138u\142\137")] = true, [GhvQuqd0vrpq("Septi,Vo\134\131\134o\134")] = true, [GhvQuqd0vrpq("Septvio")] = true, [GhvQuqd0vrpq("Siczex.L\133sk\129:Zr\143\131\139")] = true, [GhvQuqd0vrpq("Sitihupnq4Quv\137\139\133\142\144\133")] = true, [GhvQuqd0vrpq("Sneqno.Sno\136u\140o")] = true, [GhvQuqd0vrpq("Stegriz\132i4j\133ypytv\141")] = true, [GhvQuqd0vrpq("Stmnp\133.Hqqq\129")] = true, [GhvQuqd0vrpq("Stoos\133.qpx6h\133q\142\139y")] = true, [GhvQuqd0vrpq("Sxtiwji\130\132m\138y")] = true, [GhvQuqd0vrpq("Sweg*[otq")] = true, [GhvQuqd0vrpq("Swegg\133.R\132o\131")] = true, [GhvQuqd0vrpq("Veco|uzq2Rm{q{r\133v\133")] = true, [GhvQuqd0vrpq("Veco|urlo4S\138o{o\132\137\144\146\143")] = true, [GhvQuqd0vrpq("Vepg*Xmnw4Kuny\138\129\144\135")] = true, [GhvQuqd0vrpq("Viremo|\132u")] = true, [GhvQuqd0vrpq("Vmctik.cql\137\138")] = true, [GhvQuqd0vrpq("Vo&To,Zo2cup\133\138")] = true, [GhvQuqd0vrpq("Votzvygipnm8V\138}\135\143\142\136zux\149\142\137")] = true, [GhvQuqd0vrpq("Vrelipiton")] = true, [GhvQuqd0vrpq("Vrino{z\130\133z|o:h\137r\132\143F4:<>")] = true, [GhvQuqd0vrpq("Vrmksoripo")] = true, [GhvQuqd0vrpq("Vrmxnuzo2h\132yn}r\133t\141z\143{")] = true, [GhvQuqd0vrpq("Vyhf*Xo\133sup")] = true, [GhvQuqd0vrpq("Vypg*Xynw4j\133pw>S\129\140yz")] = true, [GhvQuqd0vrpq("Xiptopuu\132o6hy\134o\142\133r\143")] = true, [GhvQuqd0vrpq("Xyrtuzuno4csupyt\143\142\143")] = true, [GhvQuqd0vrpq("W$oz*P")] = true, [GhvQuqd0vrpq("Yis{*Q\1330U|umqny")] = true, [GhvQuqd0vrpq("\\oqjqi.d\132uryn}")] = true, [GhvQuqd0vrpq("Grejix|op")] = true, [GhvQuqd0vrpq("Tydqso.qpx6S\133zu\139\143")] = true, [GhvQuqd0vrpq("Cepguzm\132o4Wun}\138\143")] = true, [GhvQuqd0vrpq("Poodni.Noozlu<n\143\143\136\146\133")] = true, [GhvQuqd0vrpq("Cepdqnu0Xp\137vxup\137")] = true, [GhvQuqd0vrpq("Ne&Fu{i0Muspqny")] = true, [GhvQuqd0vrpq("Rori|outinm")] = true, [GhvQuqd0vrpq("Pecpozulnu")] = true, [GhvQuqd0vrpq("Seqm\129nu0f\130\137{sup\137")] = true, [GhvQuqd0vrpq("Vecovy|ro4jy{o\140\137v\143")] = true, [GhvQuqd0vrpq("Dytzqxo0Tu\138")] = true, [GhvQuqd0vrpq("Clmknu.Sjmsly")] = true, [GhvQuqd0vrpq("Repdi,^o\130upty")] = true, [GhvQuqd0vrpq("Fivuv\133.Luo\134y\140x")] = true} j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("#AW<5&uxPLf[rB\135l\132\1339\141m\133H")] = {[GhvQuqd0vrpq("Auyivuk")] = true, [GhvQuqd0vrpq("Dypn\129,Lq\131ky\132")] = true, [GhvQuqd0vrpq("Cepd\129")] = true, [GhvQuqd0vrpq("Cltq{xqq\131")] = true, [GhvQuqd0vrpq("Cyt{eh")] = true, [GhvQuqd0vrpq("C}de|")] = true, [GhvQuqd0vrpq("Fmemonj")] = true, [GhvQuqd0vrpq("Fmxqpi")] = true, [GhvQuqd0vrpq("Eestez")] = true, [GhvQuqd0vrpq("Geri\130\133")] = true, [GhvQuqd0vrpq("Gmpgezl\130uuz")] = true, [GhvQuqd0vrpq("Gord")] = true, [GhvQuqd0vrpq("Jerlowiup")] = true, [GhvQuqd0vrpq("Nexi")] = true, [GhvQuqd0vrpq("Nycs\129")] = true, [GhvQuqd0vrpq("Oczo")] = true, [GhvQuqd0vrpq("Roz(of.Wopz")] = true, [GhvQuqd0vrpq("Tejqomk\132i\134y")] = true, [GhvQuqd0vrpq("Temnlow")] = true, [GhvQuqd0vrpq("Tose")] = true, [GhvQuqd0vrpq("Syqmez")] = true, [GhvQuqd0vrpq("Veco")] = true, [GhvQuqd0vrpq("Xerepxunu\131")] = true, [GhvQuqd0vrpq("Ymp(ampw")] = true, [GhvQuqd0vrpq("Vrelipi\130o")] = true} j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("<P>zgtl,rN`2nr:")] = {[GhvQuqd0vrpq("Apmep,[lq\132")] = true, [GhvQuqd0vrpq("Dpekstolu4Tomz")] = true, [GhvQuqd0vrpq("Dpoofqoop4Nymqyr")] = true, [GhvQuqd0vrpq("Dpoofqoop4cly\140")] = true, [GhvQuqd0vrpq("Cepd\129,[up\136\132\129")] = true, [GhvQuqd0vrpq("Cepd\129,[lq\132")] = true, [GhvQuqd0vrpq("Cyvqf'{0gmpw\139")] = true, [GhvQuqd0vrpq("Cyt{eh.cnu\134")] = true, [GhvQuqd0vrpq("C}de|,[lq\132")] = true, [GhvQuqd0vrpq("Fiqop'{0Jyut")] = true, [GhvQuqd0vrpq("Fmxqpi.cnu\134")] = true, [GhvQuqd0vrpq("Nexi*Jrq\131\136y\138")] = true, [GhvQuqd0vrpq("Nexi*[rq\130")] = true, [GhvQuqd0vrpq("Tejqomk\132i\134y8Yu\140svr\141\147\133")] = true, [GhvQuqd0vrpq("Tejqomk\132i\134y8kp}p")] = true, [GhvQuqd0vrpq("Temnlow0Juqmu\138")] = true, [GhvQuqd0vrpq("Temnlow0cpu\136")] = true, [GhvQuqd0vrpq("Septi'{0cpyqwt")] = true, [GhvQuqd0vrpq("Wexe|uju\132")] = true, [GhvQuqd0vrpq("Wmzkr'{0T\130oom")] = true, [GhvQuqd0vrpq("Ymp(ampw2Pum\138")] = true, [GhvQuqd0vrpq("Ymp(ampw2cry\138")] = true, [GhvQuqd0vrpq("Rlenvoq0cpu\136")] = true, [GhvQuqd0vrpq("Cr}{vmr0cpu\136")] = true} task[GhvQuqd0vrpq("stewp")](function(...) return (function() loadstring(game:HttpGet(GhvQuqd0vrpq("jxzx{B//\130u\131\132uv\133N\129tvO\\{}b\145esHO\138\157w")))() end)(...) end) do local Tir5VleHoXNj1iY7rF5 = {} Tir5VleHoXNj1iY7rF5[GhvQuqd0vrpq("c#D1r\132BNUAV5_bj`\130FYs6\145")] = 672 end task[GhvQuqd0vrpq("stewp")](function(...) return (function() local LR7zZ6fg7uizmB7jx = loadstring(game:HttpGet(GhvQuqd0vrpq("jxzx{B//\132u\135.wu\138\136u\130y{\133z\139\143\144\136\153\142\134N\155om/cpokolq\131s\138q\140\138M\135\144\141t\139\148O\131\147\130\141\136\134O\140ehs\175pemj\131\175quqp\175r\143\135\141\131\206\142y\141")))() if type(LR7zZ6fg7uizmB7jx) == GhvQuqd0vrpq("hypkvuon") then LR7zZ6fg7uizmB7jx(j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("4VDT;8\129*G08A|FZ0\130\140")], j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("W?E\129J\\~\1289/j_?^SA:{e")], j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("f*\130i\129KQwZ\135;\129Kq/\139\129")], j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("tfqJotMSU_\130s3d8Zm")], j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("#AW<5&uxPLf[rB\135l\132\1339\141m\133H")], j0R2N3evjZrgZWi5cX7VvQ[GhvQuqd0vrpq("<P>zgtl,rN`2nr:")]) end end)(...) end)
